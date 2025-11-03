@@ -16,6 +16,7 @@ import { SessionPrompt } from "../../session/prompt"
 import { EOL } from "os"
 import { Permission } from "@/permission"
 import { select } from "@clack/prompts"
+import { createOpencodeClient, type Event } from "@opencode-ai/sdk"
 
 const TOOL: Record<string, [string, string]> = {
   todowrite: ["Todo", UI.Style.TEXT_WARNING_BOLD],
@@ -28,6 +29,264 @@ const TOOL: Record<string, [string, string]> = {
   read: ["Read", UI.Style.TEXT_HIGHLIGHT_BOLD],
   write: ["Write", UI.Style.TEXT_SUCCESS_BOLD],
   websearch: ["Search", UI.Style.TEXT_DIM_BOLD],
+}
+
+async function runRemote(opts: {
+  serverUrl: string
+  message: string
+  fileParts: any[]
+  args: any
+}) {
+  const client = createOpencodeClient({
+    baseUrl: opts.serverUrl,
+    fetch: (req) => {
+      // @ts-ignore
+      req.timeout = false
+      return fetch(req)
+    },
+  })
+
+  try {
+    const session = await (async () => {
+      if (opts.args.continue) {
+        const res = await client.session.list()
+        return res.data?.find((s) => !s.parentID)
+      }
+      if (opts.args.session) {
+        const res = await client.session.get({ path: { id: opts.args.session } })
+        return res.data
+      }
+      const res = await client.session.create({})
+      return res.data
+    })()
+
+    if (!session) {
+      UI.error("Session not found")
+      process.exit(1)
+    }
+
+    const cfgRes = await client.config.get()
+    const cfg = cfgRes.data
+    if (cfg?.share === "auto" || Flag.OPENCODE_AUTO_SHARE || opts.args.share) {
+      try {
+        await client.session.share({ path: { id: session.id } })
+        UI.println(UI.Style.TEXT_INFO_BOLD + "~  https://opencode.ai/s/" + session.id.slice(-8))
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("disabled")) {
+          UI.println(UI.Style.TEXT_DANGER_BOLD + "!  " + error.message)
+        }
+      }
+    }
+
+    let errorMsg: string | undefined
+
+    function printEvent(color: string, type: string, title: string) {
+      UI.println(
+        color + `|`,
+        UI.Style.TEXT_NORMAL + UI.Style.TEXT_DIM + ` ${type.padEnd(7, " ")}`,
+        "",
+        UI.Style.TEXT_NORMAL + title,
+      )
+    }
+
+    function outputJsonEvent(type: string, data: any) {
+      if (opts.args.format === "json") {
+        const jsonEvent = {
+          type,
+          timestamp: Date.now(),
+          sessionID: session?.id,
+          ...data,
+        }
+        process.stdout.write(JSON.stringify(jsonEvent) + EOL)
+        return true
+      }
+      return false
+    }
+
+    const providersRes = await client.config.providers()
+    const providers = providersRes.data
+    const agentsRes = await client.app.agents()
+    const agents = agentsRes.data ?? []
+
+    const agent = (() => {
+      if (opts.args.agent) return agents.find((a) => a.name === opts.args.agent)
+      const build = agents.find((a) => a.name === "build")
+      if (build) return build
+      return agents[0]
+    })()
+
+    const { providerID, modelID } = (() => {
+      if (opts.args.model) {
+        const [provider, model] = opts.args.model.split("/")
+        return { providerID: provider, modelID: model }
+      }
+      if (agent?.model) return agent.model
+      const firstProvider = providers?.providers?.[0]
+      if (!firstProvider || !providers?.default) return { providerID: "", modelID: "" }
+      return {
+        providerID: firstProvider.id,
+        modelID: providers.default[firstProvider.id],
+      }
+    })()
+
+    const title = (() => {
+      if (opts.args.title !== undefined) {
+        if (opts.args.title === "") {
+          return opts.message.slice(0, 50) + (opts.message.length > 50 ? "..." : "")
+        }
+        return opts.args.title
+      }
+      return undefined
+    })()
+
+    if (title) {
+      await client.session.update({ path: { id: session.id }, body: { title } })
+    }
+
+    const eventStream = await client.event.subscribe()
+    let messageCompletedResolve: (() => void) | undefined
+
+    const completionPromise = new Promise<void>((resolve) => {
+      messageCompletedResolve = resolve
+    })
+
+    const eventListener = (async () => {
+      try {
+        for await (const event of eventStream.stream) {
+          if (event.type === "message.part.updated") {
+            const part = (event as any).properties?.part
+            if (!part || part.sessionID !== session.id) continue
+
+            if (part.type === "tool" && part.state.status === "completed") {
+              if (outputJsonEvent("tool_use", { part })) continue
+              const [tool, color] = TOOL[part.tool] ?? [part.tool, UI.Style.TEXT_INFO_BOLD]
+              const title =
+                part.state.title ||
+                (Object.keys(part.state.input ?? {}).length > 0
+                  ? JSON.stringify(part.state.input)
+                  : "Unknown")
+              printEvent(color, tool, title)
+
+              if (part.tool === "bash" && part.state.output && part.state.output.trim()) {
+                UI.println()
+                UI.println(part.state.output)
+              }
+            }
+
+            if (part.type === "step-start") {
+              if (outputJsonEvent("step_start", { part })) continue
+            }
+
+            if (part.type === "step-finish") {
+              if (outputJsonEvent("step_finish", { part })) continue
+            }
+
+            if (part.type === "text") {
+              const text = part.text
+              const isPiped = !process.stdout.isTTY
+
+              if (part.time?.end) {
+                if (outputJsonEvent("text", { part })) continue
+                if (!isPiped) UI.println()
+                process.stdout.write((isPiped ? text : UI.markdown(text)) + EOL)
+                if (!isPiped) UI.println()
+              }
+            }
+          }
+
+          if (event.type === "session.error") {
+            const { sessionID, error } = (event as any).properties
+            if (sessionID !== session.id || !error) continue
+            let err = String((error as any).name)
+
+            if ("data" in error && (error as any).data && "message" in (error as any).data) {
+              err = (error as any).data.message
+            }
+            errorMsg = errorMsg ? errorMsg + EOL + err : err
+
+            if (outputJsonEvent("error", { error })) continue
+            UI.error(err)
+          }
+
+          if (event.type === "permission.updated") {
+            const permission = (event as any).properties
+            const message = `Permission required to run: ${permission.title}`
+
+            const result = await select({
+              message,
+              options: [
+                { value: "once", label: "Allow once" },
+                { value: "always", label: "Always allow" },
+                { value: "reject", label: "Reject" },
+              ],
+              initialValue: "once",
+            }).catch(() => "reject")
+            const response = (result.toString().includes("cancel") ? "reject" : result) as
+              | "once"
+              | "always"
+              | "reject"
+
+            await client.postSessionIdPermissionsPermissionId({
+              path: { id: session.id, permissionID: permission.id },
+              body: { response },
+            })
+          }
+
+          if (event.type === "session.idle") {
+            messageCompletedResolve?.()
+            return
+          }
+        }
+      } catch (e) {
+        // Event stream ended
+        messageCompletedResolve?.()
+      }
+    })()
+
+    // Give event listener a chance to start
+    await new Promise((r) => setTimeout(r, 100))
+
+    if (opts.args.command) {
+      await client.session.command({
+        path: { id: session.id },
+        body: {
+          agent: agent?.name || "",
+          model: providerID + "/" + modelID,
+          command: opts.args.command,
+          arguments: opts.message,
+        },
+      })
+    } else {
+      await client.session.prompt({
+        path: { id: session.id },
+        body: {
+          agent: agent?.name || "",
+          model: {
+            providerID,
+            modelID,
+          },
+          parts: [
+            ...opts.fileParts,
+            {
+              id: Identifier.ascending("part"),
+              type: "text",
+              text: opts.message,
+            },
+          ],
+        },
+      })
+    }
+
+    // Wait for message to complete (session.idle event)
+    await completionPromise
+
+    if (errorMsg) process.exit(1)
+  } catch (error) {
+    UI.error(
+      `Failed to connect to server at ${opts.serverUrl}: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    process.exit(1)
+  }
 }
 
 export const RunCommand = cmd({
@@ -84,6 +343,11 @@ export const RunCommand = cmd({
         type: "string",
         describe: "title for the session (uses truncated prompt if no value provided)",
       })
+      .option("server", {
+        type: "string",
+        describe:
+          "attach to a running opencode server (auto-detected from OPENCODE_SERVER env var)",
+      })
   },
   handler: async (args) => {
     let message = args.message.join(" ")
@@ -122,6 +386,17 @@ export const RunCommand = cmd({
     if (message.trim().length === 0 && !args.command) {
       UI.error("You must provide a message or a command")
       process.exit(1)
+    }
+
+    const serverUrl = args.server || process.env.OPENCODE_SERVER
+
+    if (serverUrl) {
+      return await runRemote({
+        serverUrl,
+        message,
+        fileParts,
+        args,
+      })
     }
 
     await bootstrap(process.cwd(), async () => {
